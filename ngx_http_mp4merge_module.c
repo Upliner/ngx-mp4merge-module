@@ -819,6 +819,8 @@ static mp4_atom_stsc_t *merge_stsc(mp4_atom_t *stbl, mp4_atom_stsc_t *a, mp4_sts
 
 	ngx_memcpy(wr, a->tbl, (u_char*)(ap->entry - 1) - (u_char*)a->tbl);
 	wr += ap->entry - a->tbl - 1;
+	if (ap->chunk_no > be32toh(ap->entry[-1].first_chunk))
+		*wr++ = ap->entry[-1];
 	if (ap->chunk_no < ap->chunk_count) {
 		wr->first_chunk = htobe32(ap->chunk_no);
 		wr->desc_id = ap->entry[-1].desc_id;
@@ -830,7 +832,7 @@ static mp4_atom_stsc_t *merge_stsc(mp4_atom_t *stbl, mp4_atom_stsc_t *a, mp4_sts
 	}
 	b_end = b->tbl + be32toh(b->sample_cnt);
 	for (rd = b->tbl; rd < b_end; rd++, wr++) {
-		wr->first_chunk = htobe32(be32toh(rd->first_chunk) + ap->chunk_no + chunk_offs);
+		wr->first_chunk = htobe32(be32toh(rd->first_chunk) + ap->chunk_no - 1 + chunk_offs);
 		wr->desc_id = htobe32(be32toh(rd->desc_id) + b_offs);
 		wr->sample_cnt = rd->sample_cnt;
 	}
