@@ -891,7 +891,7 @@ static ngx_int_t merge_trak(mp4_trak_t *dest, mp4_trak_t *a, mp4_trak_t *b,
 			if (be32toh(a->stss->tbl[stss_ptr]) > frame_no)
 				break;
 		ngx_memcpy(dest->stss->tbl, a->stss->tbl, stss_ptr * 4);
-		ptr = dest->stss->tbl + size;
+		ptr = dest->stss->tbl + stss_ptr;
 		eptr = b->stss->tbl + be32toh(b->stss->entries);
 		for (rptr = b->stss->tbl; rptr < eptr; rptr++)
 			*ptr++ = htobe32(be32toh(*rptr) + frame_no);
