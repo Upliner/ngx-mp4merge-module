@@ -675,7 +675,7 @@ static ngx_int_t mp4_stsc_ptr_advance_entry2(mp4_stsc_ptr_t *ptr) {
 	}
 	ptr->samp_cnt = be32toh(ptr->entry++->sample_cnt);
 	if (ptr->entry == ptr->end)
-		ptr->next = ptr->chunk_count;
+		ptr->next = ptr->chunk_count + 1;
 	else
 		ptr->next = be32toh(ptr->entry->first_chunk);
 	ptr->samp_left = ptr->samp_cnt;
@@ -821,7 +821,7 @@ static mp4_atom_stsc_t *merge_stsc(mp4_atom_t *stbl, mp4_atom_stsc_t *a, mp4_sts
 	wr += ap->entry - a->tbl - 1;
 	if (ap->chunk_no > be32toh(ap->entry[-1].first_chunk))
 		*wr++ = ap->entry[-1];
-	if (ap->chunk_no < ap->chunk_count) {
+	if (ap->chunk_no <= ap->chunk_count) {
 		wr->first_chunk = htobe32(ap->chunk_no);
 		wr->desc_id = ap->entry[-1].desc_id;
 		wr->sample_cnt = htobe32(be32toh(ap->entry[-1].sample_cnt)-ap->samp_left);
@@ -836,14 +836,14 @@ static mp4_atom_stsc_t *merge_stsc(mp4_atom_t *stbl, mp4_atom_stsc_t *a, mp4_sts
 		wr->desc_id = htobe32(be32toh(rd->desc_id) + b_offs);
 		wr->sample_cnt = rd->sample_cnt;
 	}
-	if (ap->chunk_no < ap->chunk_count) {
+	if (ap->chunk_no <= ap->chunk_count) {
 		wr->first_chunk = htobe32(ap->chunk_no + b_chunks + chunk_offs);
 		wr->desc_id = ap->entry[-1].desc_id;
 		wr->sample_cnt = htobe32(ap->samp_left);
 		wr++;
 		mp4_stsc_ptr_advance_entry(ap);
 	}
-	if (ap->chunk_no < ap->chunk_count)
+	if (ap->chunk_no <= ap->chunk_count)
 		do {
 			wr->first_chunk = htobe32(ap->chunk_no + b_chunks + chunk_offs);
 			wr->desc_id = ap->entry[-1].desc_id;
