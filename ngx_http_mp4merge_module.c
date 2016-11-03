@@ -497,8 +497,8 @@ static ngx_int_t mp4merge_add_etag(ngx_http_mp4merge_ctx_t *ctx)
 
 	hdr->hash = 1;
 	ngx_str_set(&hdr->key, "ETag");
-	hdr->value.len = 32;
-	if (!(hdr->value.data = ngx_palloc(ctx->req->pool, 32)))
+	hdr->value.len = 34;
+	if (!(hdr->value.data = ngx_palloc(ctx->req->pool, 34)))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
 	ngx_md5_init(&etag_md5);
@@ -508,7 +508,9 @@ static ngx_int_t mp4merge_add_etag(ngx_http_mp4merge_ctx_t *ctx)
 	ngx_md5_update(&etag_md5, &ctx->mixin.file_mtime, sizeof(time_t));
 	ngx_md5_update(&etag_md5, &ctx->mixin.file_size, sizeof(size_t));
 	ngx_md5_final(md5_result, &etag_md5);
-	ngx_hex_dump(hdr->value.data, md5_result, 16);
+	ngx_hex_dump(hdr->value.data + 1, md5_result, 16);
+	hdr->value.data[0] = '"';
+	hdr->value.data[33] = '"';
 	ctx->req->headers_out.etag = hdr;
 	return NGX_OK;
 }
@@ -613,6 +615,8 @@ static ngx_int_t ngx_http_mp4merge_handler(ngx_http_request_t *r)
 
 	mp4mux_list_add_tail(&a->entry, &ctx->atoms_head);
 
+	r->root_tested = !r->error_page;
+	r->allow_ranges = 1;
 	r->headers_out.status = NGX_HTTP_OK;
 	r->headers_out.content_length_n = len_head + ctx->mdat_len;
 	ngx_str_set(&r->headers_out.content_type, "video/mp4");
