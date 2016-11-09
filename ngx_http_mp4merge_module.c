@@ -297,7 +297,8 @@ typedef struct ngx_http_mp4merge_ctx_s {
 	//mp4mux_list_t atoms_tail;
 	mp4_file_t main;
 	mp4_file_t mixin;
-	ngx_int_t inspos;
+	ngx_int_t secpos;
+	ngx_int_t fpos;
 	uint64_t mdat_len;
 	unsigned done:1;
 	unsigned move_meta:1;
@@ -502,7 +503,8 @@ static ngx_int_t mp4merge_add_etag(ngx_http_mp4merge_ctx_t *ctx)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
 	ngx_md5_init(&etag_md5);
-	ngx_md5_update(&etag_md5, &ctx->inspos, sizeof(ngx_int_t));
+	ngx_md5_update(&etag_md5, &ctx->secpos, sizeof(ngx_int_t));
+	ngx_md5_update(&etag_md5, &ctx->fpos, sizeof(ngx_int_t));
 	ngx_md5_update(&etag_md5, &ctx->main.file_mtime, sizeof(time_t));
 	ngx_md5_update(&etag_md5, &ctx->main.file_size, sizeof(size_t));
 	ngx_md5_update(&etag_md5, &ctx->mixin.file_mtime, sizeof(time_t));
@@ -579,9 +581,13 @@ static ngx_int_t ngx_http_mp4merge_handler(ngx_http_request_t *r)
 	if ((rc = mp4_set_path(&ctx->mixin, r, "mixin", &path)) != NGX_OK)
 		return rc;
 
-	if (ngx_http_arg(r, (u_char *) "pos", 3, &value) != NGX_OK)
+	if (ngx_http_arg(r, (u_char *) "pos", 3, &value) == NGX_OK)
+		parseint(value.data, value.data + value.len, &ctx->secpos);
+	else if (ngx_http_arg(r, (u_char *) "fpos", 4, &value) == NGX_OK)
+		parseint(value.data, value.data + value.len, &ctx->fpos);
+	else
 		return NGX_HTTP_NOT_FOUND;
-	parseint(value.data, value.data + value.len, &ctx->inspos);
+
 
 	if (mp4merge_add_etag(ctx) != NGX_OK)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -768,10 +774,27 @@ static ngx_int_t mp4_detect_traks(mp4_trak_t *t, mp4_trak_t **vid, mp4_trak_t **
 		}
 	return NGX_OK;
 }
+static uint32_t adjust_to_keyframe(mp4_trak_t *trak, uint32_t frame_no, mp4_stbl_ptr_t *stts_ptr, uint64_t *sample_no) {
+	uint32_t *ptr, *end;
+	uint32_t keyframe;
+	for (ptr = trak->stss->tbl, end = ptr + be32toh(trak->stss->entries); ptr < end; ptr++)
+		if ((keyframe = be32toh(*ptr) - 1) >= frame_no)
+			break;
+	if (ptr >= end) {
+		do {
+			frame_no += stts_ptr->samp_left;
+			*sample_no += stts_ptr->samp_left * stts_ptr->value;
+		} while (mp4_stbl_ptr_advance_entry(stts_ptr) == NGX_OK);
+		return frame_no;
+	} else {
+		mp4_stbl_ptr_advance_accum(stts_ptr, keyframe - frame_no, sample_no);
+		return keyframe;
+	}
+}
 static uint32_t ins_frameno(mp4_trak_t *trak, mp4_stbl_ptr_t *stts_ptr, int64_t sample_cnt, uint64_t *sample_no)
 {
 	uint64_t i;
-	uint32_t frame_no = 0, keyframe, *ptr, *end;
+	uint32_t frame_no = 0;
 	*sample_no = 0;
 	while (sample_cnt > 0) {
 		i = stts_ptr->value * stts_ptr->samp_left;
@@ -791,19 +814,7 @@ static uint32_t ins_frameno(mp4_trak_t *trak, mp4_stbl_ptr_t *stts_ptr, int64_t 
 	}
 	if (!trak->stss)
 		return frame_no;
-	for (ptr = trak->stss->tbl, end = ptr + be32toh(trak->stss->entries); ptr < end; ptr++)
-		if ((keyframe = be32toh(*ptr) - 1) >= frame_no)
-			break;
-	if (ptr >= end) {
-		do {
-			frame_no += stts_ptr->samp_left;
-			*sample_no += stts_ptr->samp_left * stts_ptr->value;
-		} while (mp4_stbl_ptr_advance_entry(stts_ptr) == NGX_OK);
-	} else {
-		mp4_stbl_ptr_advance_accum(stts_ptr, keyframe - frame_no, sample_no);
-		frame_no = keyframe;
-	}
-	return frame_no;
+	return adjust_to_keyframe(trak, frame_no, stts_ptr, sample_no);
 }
 static void *mp4_create_table(mp4_atom_t *stbl, uint32_t atom_type, ngx_int_t size, ngx_pool_t *pool)
 {
@@ -968,7 +979,7 @@ static void merge_avcC(mp4_atom_stsd_t *dest, mp4_atom_avcC_t *a, mp4_atom_avcC_
 	memcpy(ptr, b->sps.data, 4);
 	ptr += 4;
 	*ptr++ = 0x08;
-    len = be16toh(b->sps.len) - 4;
+	len = be16toh(b->sps.len) - 4;
 	memcpy(ptr, b->sps.data + 4, len);
 	ptr += len;
 	*ptr++ = 0x02;
@@ -1304,7 +1315,13 @@ static ngx_int_t mp4_do_merge(ngx_http_mp4merge_ctx_t *ctx)
 
 	if (mp4_stbl_ptr_init(&sp, ctx->main.vid->stts, ctx->req->connection->log))
 		return NGX_HTTP_NOT_FOUND;
-	vframe = ins_frameno(ctx->main.vid, &sp, ctx->inspos * ts_v, &sample_no);
+	if (ctx->secpos) {
+		vframe = ins_frameno(ctx->main.vid, &sp, ctx->secpos * ts_v, &sample_no);
+	} else {
+		sample_no = 0;
+		mp4_stbl_ptr_advance_accum(&sp, ctx->fpos, &sample_no);
+		vframe = adjust_to_keyframe(ctx->main.vid, ctx->fpos, &sp, &sample_no);
+	}
 	ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
 		"mp4merge: vframe = %uD sample_no = %uL", vframe, sample_no);
 	if ((rc = merge_trak(ctx->vid, ctx->main.vid, ctx->mixin.vid, vframe, &sp, ts_v, ctx->req->pool)) != NGX_OK)
