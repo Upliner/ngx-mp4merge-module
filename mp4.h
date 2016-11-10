@@ -125,4 +125,47 @@ typedef struct {
 	uint32_t samp_left;
 	uint32_t samp_cnt;
 } mp4_stsc_ptr_t;
+
+typedef struct {
+	uint32_t count;
+	uint32_t value;
+} __packed mp4_xtts_entry_t;
+
+typedef struct {
+	mp4_atom_hdr_t hdr;
+	u_char version;
+	u_char flags[3];
+	uint32_t entries;
+	mp4_xtts_entry_t tbl[0];
+} __packed mp4_atom_xtts_t;
+
+typedef struct {
+	mp4_xtts_entry_t *entry, *end;
+	uint32_t samp_left;
+	uint32_t value;
+} mp4_xtts_ptr_t;
+
+typedef struct {
+	mp4_atom_hdr_t hdr;
+	u_char version;
+	u_char flags[3];
+	uint32_t ctime;
+	uint32_t mtime;
+	uint32_t timescale;
+	uint32_t duration;
+	uint16_t lang;
+	uint16_t q;
+} __packed mp4_atom_mdhd_v0_t;
+
+typedef struct {
+	mp4_atom_hdr_t hdr;
+	u_char version;
+	u_char flags[3];
+	uint64_t ctime;
+	uint64_t mtime;
+	uint32_t timescale;
+	uint64_t duration;
+	uint16_t lang;
+	uint16_t q;
+} __packed mp4_atom_mdhd_v1_t;
 #endif

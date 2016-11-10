@@ -70,13 +70,77 @@ static int mp4_stsc_ptr_advance_n(mp4_stsc_ptr_t *ptr, uint32_t n) {
 	return 0;
 }
 
-mp4_atom_stsd_t *stsd = NULL;
-mp4_atom_stsc_t *stsc = NULL;
-mp4_atom_stco_t *stco = NULL;
-mp4_atom_stss_t *stss = NULL;
-mp4_atom_stsz_t *stsz = NULL;
-char co64 = 0;
+static int mp4_xtts_ptr_init(mp4_xtts_ptr_t *ptr, mp4_atom_xtts_t *atom) {
+	uint32_t entry_count = be32toh(atom->entries);
+	if (be32toh(atom->hdr.size) != entry_count * sizeof(mp4_xtts_entry_t) + sizeof(mp4_atom_xtts_t)) {
+		fprintf(stderr, "mp4_xtts_ptr_init: atom size doesn't match entry count");
+		return -1;
+	}
+	if (!entry_count) {
+		fprintf(stderr, "mp4_xtts_ptr_init: atom is empty");
+		return -1;
+	}
 
+	ptr->entry = atom->tbl;
+	ptr->end = ptr->entry + entry_count;
+	ptr->samp_left = be32toh(ptr->entry->count);
+	ptr->value = be32toh(ptr->entry->value);
+	return 0;
+}
+
+static int mp4_xtts_ptr_advance_entry(mp4_xtts_ptr_t *ptr) {
+	if (++ptr->entry >= ptr->end) {
+		ptr->samp_left = 1; // Make sure that subsequent calls will return error too
+		return -1;
+	}
+	ptr->samp_left = be32toh(ptr->entry->count);
+	ptr->value = be32toh(ptr->entry->value);
+	return 0;
+}
+static int mp4_xtts_ptr_advance(mp4_xtts_ptr_t *ptr) {
+	if (--ptr->samp_left)
+		return 0;
+	return mp4_xtts_ptr_advance_entry(ptr);
+}
+static int mp4_xtts_ptr_advance_n(mp4_xtts_ptr_t *ptr, uint32_t n) {
+	while (n >= ptr->samp_left) {
+		n -= ptr->samp_left;
+		if (mp4_xtts_ptr_advance_entry(ptr) != 0)
+			return -1;
+	}
+	ptr->samp_left -= n;
+	return 0;
+}
+static int mp4_xtts_ptr_advance_accum(mp4_xtts_ptr_t *ptr, uint32_t n, uint64_t *sample_no) {
+	while (n >= ptr->samp_left) {
+		n -= ptr->samp_left;
+		*sample_no += ptr->samp_left * ptr->value;
+		if (mp4_xtts_ptr_advance_entry(ptr) != 0)
+			return -1;
+	}
+	ptr->samp_left -= n;
+	*sample_no += n * ptr->value;
+	return 0;
+}
+
+mp4_atom_stsd_t *stsd;
+mp4_atom_stsc_t *stsc;
+mp4_atom_stco_t *stco;
+mp4_atom_stss_t *stss;
+mp4_atom_stsz_t *stsz;
+mp4_atom_xtts_t *stts, *ctts;
+char co64;
+uint32_t timescale;
+int black_tresh = 32;
+int frag_tresh = 20;
+double sec_tresh = 0.2;
+uint64_t sample_tresh;
+int reset_mp4() {
+	stsd = NULL; stsc = NULL; stco = NULL; stss = NULL; stsz = NULL;
+	stts = ctts = NULL;
+	co64 = 0;
+	timescale = 0;
+}
 int parse_atoms(uint8_t *ptr, uint8_t *end) {
 	uint64_t size;
 	while (ptr < end) {
@@ -122,26 +186,60 @@ int parse_atoms(uint8_t *ptr, uint8_t *end) {
 			case ATOM('s', 't', 's', 'z'):
 				stsz = (mp4_atom_stsz_t*)ptr;
 				break;
+			case ATOM('s', 't', 't', 's'):
+				stts = (mp4_atom_xtts_t*)ptr;
+				break;
+			case ATOM('c', 't', 't', 's'):
+				ctts = (mp4_atom_xtts_t*)ptr;
+				break;
+			case ATOM('m', 'd', 'h', 'd'):
+				switch (((mp4_atom_mdhd_v0_t*)ptr)->version) {
+				case 0: timescale = be32toh(((mp4_atom_mdhd_v0_t*)ptr)->timescale); break;
+				case 1: timescale = be32toh(((mp4_atom_mdhd_v1_t*)ptr)->timescale); break;
+				default:
+					fprintf(stderr, "Invalid mdhd version\n");
+					return -1;
+				}
+				sample_tresh = sec_tresh * timescale;
+				break;
 		}
 		ptr += size;
 	}
 	return 0;
 }
-int black_tresh = 32;
-int frag_tresh = 20;
+uint8_t *map;
+AVFrame frame;
+int is_black() {
+	int x,y, i = 0, mx = (int64_t)frame.width * frame.height / frag_tresh;
+	uint8_t *ptr;
+	if (!frame.data[0])
+		return 0;
+	for (y = 0; y < frame.height; y++) {
+		ptr = frame.data[0] + y * frame.linesize[0];
+		for (x = 0; x < frame.height; x++)
+			if (*ptr++ > black_tresh) {
+				i += *ptr;
+				if (i > mx)
+					return 0;
+			}
+	}
+	return 1;
+}
+static inline uint8_t *mp4_chunk(uint32_t chunk_no) {
+	return map + (co64 ? be64toh(stco->u.tbl64[chunk_no]) : be32toh(stco->u.tbl[chunk_no]));
+}
 int process_file(char *filename)
 {
 	struct stat st;
-	uint8_t *map, *pixptr;
 	uint32_t *ptr, *end;
-	uint32_t fnum = 1;
-	int fd, i, len, mx;
-	int x,y;
+	uint32_t fnum = 1, chunk_no, frame_cnt;
+	uint64_t sample_no = 0, sample_kf, sample_nonblack;
+	int fd, i, len;
 	int got_frame;
-	AVFrame frame;
 	AVPacket pkt;
 	AVCodecContext avctx;
-	mp4_stsc_ptr_t sp;
+	mp4_stsc_ptr_t stscp;
+	mp4_xtts_ptr_t sttsp, cttsp;
 	uint64_t co;
 	fd = open(filename, O_RDONLY);
 	fstat(fd, &st);
@@ -150,68 +248,99 @@ int process_file(char *filename)
 	if (map == MAP_FAILED) {
 		return -1;
 	}
+	reset_mp4();
 	parse_atoms(map, map + st.st_size);
-	if (!stsd || !stsc || !stco || !stss || !stsz) {
-		fprintf(stderr, "Invalid mp4\n");
-		return -1;
-	}
+	if (!stsd || !stsc || !stco || !stss || !stsz || !stts || !timescale)
+		goto mp4err;
+	cttsp.value = 0;
+	if (mp4_stsc_ptr_init(&stscp, stsc, be32toh(stco->chunk_cnt)) != 0
+			|| mp4_xtts_ptr_init(&sttsp, stts) != 0
+			|| (ctts && mp4_xtts_ptr_init(&cttsp, ctts) != 0))
+		goto mp4err;
 	av_init_packet(&pkt);
-	memset(&frame, 0, sizeof(frame));
-	av_frame_unref(&frame);
 	avcodec_get_context_defaults3(&avctx, h264);
 	avctx.extradata = &stsd->entry.avc1.avcC.version;
 	avctx.extradata_size = be32toh(stsd->entry.avc1.avcC.hdr.size) - 8;
 	avcodec_open2(&avctx, h264, NULL);
-	mp4_stsc_ptr_init(&sp, stsc, be32toh(stco->chunk_cnt));
 	ptr = stss->tbl;
 	end = ptr + be32toh(stss->entries);
+	frame_cnt = be32toh(stsz->sample_cnt);
 	for (;ptr < end; ptr++) {
-		if (mp4_stsc_ptr_advance_n(&sp, be32toh(*ptr) - fnum) != 0) {
+		// go to the next keyframe
+		i = be32toh(*ptr) - fnum;
+		if (i < 0)
+			continue;
+		if (mp4_stsc_ptr_advance_n(&stscp, i) != 0) {
 			fprintf(stderr, "stsc advance failed!\n");
 			break;
 		}
-		fnum = be32toh(*ptr);
-		pkt.data = map + (co64 ? be64toh(stco->u.tbl64[sp.chunk_no - 1]) : be32toh(stco->u.tbl[sp.chunk_no - 1]));
-		if (fnum > be32toh(stsz->sample_cnt)){
-			fprintf(stderr, "frame %u is out of range!\n", fnum);
+		if (mp4_xtts_ptr_advance_accum(&sttsp, i, &sample_no) != 0) {
+			fprintf(stderr, "stts advance failed!\n");
 			break;
 		}
-		for (i = fnum - 1 - (be32toh(sp.entry[-1].sample_cnt) - sp.samp_left); i < (fnum - 1); i++)
+		if (ctts && mp4_xtts_ptr_advance_n(&cttsp, i) != 0) {
+			fprintf(stderr, "ctts advance failed!\n");
+			break;
+		}
+		fnum = be32toh(*ptr);
+		pkt.data = mp4_chunk(stscp.chunk_no - 1);
+		if (fnum > frame_cnt){
+			fprintf(stderr, "Frame %u is out of range!\n", fnum);
+			break;
+		}
+		for (i = fnum - 1 - (be32toh(stscp.entry[-1].sample_cnt) - stscp.samp_left); i < (fnum - 1); i++)
 			pkt.data += be32toh(stsz->tbl[i]);
 		pkt.size = be32toh(stsz->tbl[i]);
-		while (pkt.size > 0) {
-			len = avcodec_decode_video2(&avctx, &frame, &got_frame, &pkt);
-			if (len < 0) {
-				fprintf(stderr, "Decode frame %i failed\n", i);
-				goto ex;
+		sample_kf = sample_no + cttsp.value;
+		sample_nonblack = -1;
+		chunk_no = stscp.chunk_no;
+		while (fnum < frame_cnt) {
+			if (pkt.data < map || pkt.data + pkt.size > map + st.st_size) {
+				fprintf(stderr, "Frame %u has invalid chunk offset: %li\n", fnum, pkt.data - map);
+				break;
 			}
-			if (got_frame) {
-				if (!frame.data[0])
+			while (pkt.size > 0) {
+				len = avcodec_decode_video2(&avctx, &frame, &got_frame, &pkt);
+				if (len < 0) {
+					fprintf(stderr, "Decode frame %i failed\n", len);
 					break;
-				i = 0;
-				mx = (int64_t)frame.width * frame.height / frag_tresh;
-				for (y = 0; y < frame.height; y++) {
-					pixptr = frame.data[0] + y * frame.linesize[0];
-					for (x = 0; x < frame.height; x++)
-						if (*pixptr++ > black_tresh) {
-							i += *pixptr;
-							if (i > mx) {
-								y = frame.height + 1;
-								break;
-							}
-						}
 				}
-				if (y == frame.height)
-					printf("%i\n", fnum - 1);
+				if (got_frame) {
+					if (!is_black())
+						sample_nonblack = sample_no + cttsp.value;
+				}
+				pkt.data += len;
+				pkt.size -= len;
 			}
-			pkt.data += len;
-			pkt.size -= len;
+			if (sample_nonblack == sample_kf)
+				break;
+			sample_no += sttsp.value;
+			if (sample_no > sample_kf + sample_tresh || sample_no >= sample_nonblack)
+				break;
+			if (mp4_stsc_ptr_advance(&stscp) != 0
+					|| mp4_xtts_ptr_advance(&sttsp) != 0
+					|| (ctts && mp4_xtts_ptr_advance(&cttsp) != 0))
+				break;
+			if (stscp.chunk_no != chunk_no) {
+				chunk_no = stscp.chunk_no;
+				pkt.data = mp4_chunk(chunk_no - 1);
+			} else
+				pkt.data += pkt.size;
+			pkt.size = be32toh(stsz->tbl[fnum++]);
 		}
+		if (sample_nonblack - sample_kf > sample_tresh)
+			printf("%i\n", i);
 	}
 ex:
 	avcodec_close(&avctx);
 	munmap(map, st.st_size);
 	close(fd);
+	return 0;
+mp4err:
+	fprintf(stderr, "Invalid mp4\n");
+	munmap(map, st.st_size);
+	close(fd);
+	return 1;
 }
 
 
@@ -222,9 +351,18 @@ int main(int argc, char **argv)
 	avcodec_register_all();
 	h264 = avcodec_find_decoder_by_name("h264");
     //avcodec_register(&ff_h264_decoder);
+	memset(&frame, 0, sizeof(frame));
+	av_frame_unref(&frame);
 
-	for (i = 1; i < argc; i++)
-		process_file(argv[i]);
-
+	if (argc < 2) {
+		fprintf(stderr, "Usage: detect_black [-t secs] filename");
+		return 1;
+	}
+	i = 1;
+	if (argc > 3 && argv[i] == "-t") {
+		sec_tresh =
+		i += 2;
+	}
+	process_file(argv[i]);
 	return 0;
 }
