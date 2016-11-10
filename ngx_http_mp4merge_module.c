@@ -1440,10 +1440,9 @@ static ngx_int_t mp4merge_do_open_file(ngx_open_file_info_t *of, ngx_file_t *f, 
 
 		return NGX_HTTP_NOT_FOUND;
 	}
-	ngx_directio_off(f->fd);
 	f->fd = of->fd;
 	f->name = *name;
-	//f->directio = of->is_directio;
+	f->directio = of->is_directio;
 	f->log = r->connection->log;
 	return NGX_OK;
 }
@@ -1656,6 +1655,9 @@ static ngx_int_t mp4_parse(ngx_http_mp4merge_ctx_t *ctx, mp4_file_t *mp4f)
 
 	MP4MUX_INIT_LIST_HEAD(&mp4f->atoms);
 
+	if (mp4f->file.directio)
+		ngx_directio_off(mp4f->file.fd);
+
 	for (pos = 0; pos < mp4f->file_size; pos += size) {
 		n = ngx_read_file(&mp4f->file, (u_char *)&hdr, sizeof(hdr), pos);
 
@@ -1720,6 +1722,9 @@ static ngx_int_t mp4_parse(ngx_http_mp4merge_ctx_t *ctx, mp4_file_t *mp4f)
 		ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
 			"end atom: %s %i", atom_name, size);
 	}
+
+	if (mp4f->file.directio)
+		ngx_directio_on(mp4f->file.fd);
 
 	mp4mux_list_for_each_entry(atom, &mp4f->atoms, entry) {
 		memcpy(atom_name, &atom->hdr->type, 4);
