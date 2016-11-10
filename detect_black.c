@@ -305,10 +305,8 @@ int process_file(char *filename)
 					fprintf(stderr, "Decode frame %i failed\n", len);
 					break;
 				}
-				if (got_frame) {
-					if (!is_black())
-						sample_nonblack = sample_no + cttsp.value;
-				}
+				if (got_frame && sample_no + cttsp.value < sample_nonblack && !is_black())
+					sample_nonblack = sample_no + cttsp.value;
 				pkt.data += len;
 				pkt.size -= len;
 			}
