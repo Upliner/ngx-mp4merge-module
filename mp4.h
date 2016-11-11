@@ -37,13 +37,24 @@ typedef struct {
 } __packed mp4_atom_hdlr_t;
 
 typedef struct {
+	u_char cnt;
+	uint16_t len;
+	u_char data[0];
+} __packed avcC_xps_t;
+
+typedef struct {
 	mp4_atom_hdr_t hdr;
 	u_char version;
 	u_char prof_ind;
 	u_char prof_comp;
 	u_char level;
 	u_char sf_len;
-	u_char data[0];
+	avcC_xps_t sps;
+	u_char sps_nal_type;
+	u_char sps_prof_ind;
+	u_char sps_prof_comp;
+	u_char sps_level;
+	u_char sps_id;
 } __packed mp4_atom_avcC_t;
 
 typedef struct {
