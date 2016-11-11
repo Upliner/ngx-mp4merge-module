@@ -111,17 +111,6 @@ static int mp4_xtts_ptr_advance_n(mp4_xtts_ptr_t *ptr, uint32_t n) {
 	ptr->samp_left -= n;
 	return 0;
 }
-static int mp4_xtts_ptr_advance_accum(mp4_xtts_ptr_t *ptr, uint32_t n, uint64_t *sample_no) {
-	while (n >= ptr->samp_left) {
-		n -= ptr->samp_left;
-		*sample_no += ptr->samp_left * ptr->value;
-		if (mp4_xtts_ptr_advance_entry(ptr) != 0)
-			return -1;
-	}
-	ptr->samp_left -= n;
-	*sample_no += n * ptr->value;
-	return 0;
-}
 
 mp4_atom_stsd_t *stsd;
 mp4_atom_stsc_t *stsc;
@@ -233,7 +222,7 @@ int process_file(char *filename)
 	struct stat st;
 	uint32_t *ptr, *end;
 	uint32_t fnum = 1, chunk_no, frame_cnt;
-	uint64_t sample_no = 0, sample_kf, sample_nonblack;
+	uint64_t sample_no, sample_kf, sample_nonblack;
 	int fd, i, len;
 	int got_frame;
 	AVPacket pkt;
@@ -274,7 +263,7 @@ int process_file(char *filename)
 			fprintf(stderr, "stsc advance failed!\n");
 			break;
 		}
-		if (mp4_xtts_ptr_advance_accum(&sttsp, i, &sample_no) != 0) {
+		if (mp4_xtts_ptr_advance_n(&sttsp, i) != 0) {
 			fprintf(stderr, "stts advance failed!\n");
 			break;
 		}
@@ -291,7 +280,8 @@ int process_file(char *filename)
 		for (i = fnum - 1 - (be32toh(stscp.entry[-1].sample_cnt) - stscp.samp_left); i < (fnum - 1); i++)
 			pkt.data += be32toh(stsz->tbl[i]);
 		pkt.size = be32toh(stsz->tbl[i]);
-		sample_kf = sample_no + cttsp.value;
+		sample_no = 0;
+		sample_kf = cttsp.value;
 		sample_nonblack = -1;
 		chunk_no = stscp.chunk_no;
 		while (fnum < frame_cnt) {
@@ -357,8 +347,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	i = 1;
-	if (argc > 3 && argv[i] == "-t") {
-		sec_tresh =
+	if (argc > 3 && strcmp(argv[i], "-t") == 0) {
+		sec_tresh = atof(argv[i+1]);
 		i += 2;
 	}
 	process_file(argv[i]);
