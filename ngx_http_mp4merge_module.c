@@ -74,7 +74,7 @@ struct mp4_atom_s {
 typedef struct mp4_atom_s mp4_atom_t;
 
 typedef struct mp4merge_cache_entry_s mp4merge_cache_entry_t;
-
+/*
 typedef struct {
 	mp4merge_cache_entry_t **hashtable;
 	u_char *start, *end;
@@ -85,7 +85,7 @@ struct mp4merge_cache_entry_s {
 	mp4merge_cache_entry_t *hash_next;
 	u_char md5[16];
 	uint64_t frame_no;
-};
+};*/
 
 typedef struct mp4_file_s mp4_file_t;
 typedef struct mp4_trak_s mp4_trak_t;
@@ -94,6 +94,10 @@ typedef struct {
 	mp4_atom_t *mdhd;
 	mp4_atom_t *stbl;
 	mp4_atom_stco_t *stco;
+	mp4_stsc_ptr_t stsc_ptr;
+	uint32_t frameno;
+	uint32_t chunk_cnt;
+	uint64_t trak_len;
 } mp4_trak_output_t;
 struct mp4_trak_s {
 	mp4_file_t *file;
@@ -116,7 +120,7 @@ struct mp4_trak_s {
 	off_t co;
 	mp4_stsc_ptr_t stsc_ptr;
 	uint32_t timescale;
-	uint32_t frame_no, frame_end;
+	uint32_t frame_no, frame_end, frame_cnt;
 	bool_t co64;
 	bool_t shift_pps;
 };
@@ -138,7 +142,9 @@ struct mp4_file_s {
 
 typedef struct ngx_http_mp4merge_ctx_s {
 	ngx_http_request_t *req;
+	ngx_event_handler_pt write_handler;
 	ngx_chain_t *chain, *chain_last;
+	ngx_chain_t *free, *busy;
 	mp4mux_list_t atoms_head;
 	mp4_trak_output_t *traks;
 	ngx_int_t trak_cnt;
@@ -147,8 +153,10 @@ typedef struct ngx_http_mp4merge_ctx_s {
 	ngx_int_t secpos;
 	ngx_int_t fpos;
 	uint64_t mdat_len;
-	off_t range_start, range_end;
 	u_char convbuf[CONV_BUFSIZE];
+	mp4_file_t *cur_file;
+	//mp4_trak_t *cur_trak;
+	int cb_w, cb_r;
 	bool_t co64;
 	unsigned done:1;
 	unsigned move_meta:1;
@@ -171,6 +179,7 @@ static uint32_t mp4_atom_containers[] = {
 	ATOM('m', 'i', 'n', 'f'),
 	ATOM('s', 't', 'b', 'l')
 };
+typedef ngx_int_t appendfunc(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t *t, uint32_t size);
 
 /* These two structs must be kept in sync with ngx_http_range_filter_module.c
    It seems that there are no other way to hook range-skipping.
@@ -194,7 +203,7 @@ extern ngx_module_t ngx_http_range_body_filter_module;
 static char *ngx_http_mp4merge(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_http_mp4merge_create_conf(ngx_conf_t *cf);
 static char *ngx_http_mp4merge_merge_conf(ngx_conf_t *cf, void *parent, void *child);
-static ngx_int_t mp4_stsc_ptr_init(mp4_stsc_ptr_t *ptr, mp4_atom_stsc_t *atom, uint32_t chunk_count, ngx_log_t *log);
+static ngx_int_t mp4_stsc_ptr_init(mp4_trak_t *t, ngx_log_t *log);
 static ngx_int_t mp4_xtts_ptr_init(mp4_xtts_ptr_t *ptr, mp4_atom_xtts_t *atom, ngx_log_t *log);
 //static ngx_int_t mp4_xtts_ptr_advance(mp4_xtts_ptr_t *ptr);
 static ngx_int_t mp4_xtts_ptr_advance_entry(mp4_xtts_ptr_t *ptr);
@@ -205,10 +214,15 @@ static ngx_int_t mp4_parse(ngx_http_mp4merge_ctx_t *ctx, mp4_file_t *f);
 static mp4_atom_t *mp4_clone_primitive_atom(mp4_atom_hdr_t *hdr, ngx_pool_t *pool);
 static mp4_atom_t *mp4_clone_atom(mp4_atom_t *atom, mp4_trak_output_t *dst_trak, ngx_pool_t *pool);
 static off_t mp4_build_atoms(mp4mux_list_t *list, ngx_log_t *log);
-static ngx_int_t mp4_build_chain_ex(ngx_http_mp4merge_ctx_t *ctx, mp4mux_list_t *list, ngx_chain_t **out, ngx_chain_t **last);
-static ngx_chain_t *mp4_build_chain(ngx_http_mp4merge_ctx_t *ctx, mp4mux_list_t *list);
+static ngx_int_t mp4_build_chain(ngx_http_mp4merge_ctx_t *ctx, mp4mux_list_t *list);
 static ngx_int_t mp4merge_open_file(ngx_http_mp4merge_ctx_t *ctx, mp4_file_t *f);
 static ngx_int_t mp4_do_merge(ngx_http_mp4merge_ctx_t *ctx);
+static ngx_int_t mp4merge_co_alloc_seg(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t **traks, appendfunc *append);
+static ngx_int_t mp4merge_co_trak_init(mp4_trak_t *trak, ngx_log_t *log);
+static void mp4merge_write_handler(ngx_event_t *ev);
+static ngx_int_t mp4merge_write_content(ngx_http_mp4merge_ctx_t *ctx);
+static ngx_int_t appendfunc_chain(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t *t, uint32_t size);
+static ngx_int_t appendfunc_co_only(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t *t, uint32_t size);
 
 static ngx_command_t  ngx_http_mp4merge_commands[] = {
 
@@ -242,7 +256,6 @@ static ngx_http_module_t  ngx_http_mp4merge_module_ctx = {
 	ngx_http_mp4merge_create_conf,   /* create location configuration */
 	ngx_http_mp4merge_merge_conf     /* merge location configuration */
 };
-
 
 ngx_module_t  ngx_http_mp4merge_module = {
 	NGX_MODULE_V1,
@@ -289,6 +302,9 @@ static uint64_t gcd(uint64_t u, uint64_t v) {
 static uint64_t lcm(uint32_t u, uint32_t v) {
 	return (uint64_t)u*v/gcd(u,v);
 }
+static inline uint64_t mp4_chunk_offset(mp4_trak_t *trak, uint32_t chunk_no) {
+	return trak->co64 ? be64toh(trak->stco->u.tbl64[chunk_no]) : be32toh(trak->stco->u.tbl[chunk_no]);
+}
 static ngx_int_t mp4_set_path(mp4_file_t *f, ngx_http_request_t *r, char *arg, ngx_str_t *path)
 {
 	ngx_str_t fname, value;
@@ -307,7 +323,6 @@ static ngx_int_t mp4_set_path(mp4_file_t *f, ngx_http_request_t *r, char *arg, n
 	f->basename = value;
 	return NGX_OK;
 }
-
 static ngx_int_t mp4merge_add_etag(ngx_http_mp4merge_ctx_t *ctx)
 {
 	u_char md5_result[16];
@@ -336,16 +351,6 @@ static ngx_int_t mp4merge_add_etag(ngx_http_mp4merge_ctx_t *ctx)
 	ctx->req->headers_out.etag = hdr;
 	return NGX_OK;
 }
-static void mp4_adjust_co(mp4_trak_output_t *t, int32_t a, bool_t co64) {
-	uint32_t i, n = t->stco->chunk_cnt;
-	if (co64)
-		for (i = 0; i < n; i++)
-			t->stco->u.tbl64[i] = htobe64(t->stco->u.tbl64[i] + a);
-	else
-		for (i = 0; i < n; i++)
-			t->stco->u.tbl[i] = htobe32(t->stco->u.tbl[i] + a);
-	t->stco->chunk_cnt = htobe32(t->stco->chunk_cnt);
-}
 static mp4_atom_t *mp4_alloc_atom(ngx_pool_t *pool, size_t data_size) {
 	mp4_atom_t *a = ngx_palloc(pool, sizeof(mp4_atom_t) + data_size);
 	if (!a) return NULL;
@@ -353,17 +358,62 @@ static mp4_atom_t *mp4_alloc_atom(ngx_pool_t *pool, size_t data_size) {
 	if (data_size) a->hdr = a->data;
 	return a;
 }
+static ngx_int_t mp4_add_mdat(ngx_http_mp4merge_ctx_t *ctx) {
+	mp4_atom_t *a = mp4_alloc_atom(ctx->req->pool, sizeof(mp4_atom_hdr_t) + ctx->co64 ? 8 : 0);
+	if (!a)
+		return NGX_HTTP_INTERNAL_SERVER_ERROR;
+	a->hdr->type = ATOM('m', 'd', 'a', 't');
+	if (ctx->co64) {
+		a->hdr->size = htobe32(1);
+		a->hdr->u.data64[0] = htobe64(sizeof(mp4_atom_hdr_t) + 8 + ctx->mdat_len);
+	} else
+		a->hdr->size = htobe32(sizeof(mp4_atom_hdr_t) + ctx->mdat_len);
+
+	mp4mux_list_add_tail(&a->entry, &ctx->atoms_head);
+	return NGX_OK;
+}
+static ngx_int_t mp4merge_output_chain(ngx_http_mp4merge_ctx_t *ctx) {
+	ngx_http_core_loc_conf_t *clcf;
+	ngx_http_request_t *r = ctx->req;
+	ngx_int_t rc = ngx_http_output_filter(r, ctx->chain);
+	ngx_event_t *ev;
+	ngx_chain_update_chains(r->pool, &ctx->free, &ctx->busy, &ctx->chain, &ngx_http_mp4merge_module);
+	ctx->chain_last = NULL;
+	if (rc == NGX_OK || !ctx->busy)
+		return NGX_OK;
+	if (rc == NGX_AGAIN) {
+		if (ctx->done)
+			return NGX_OK;
+		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+			"mp4merge: ngx_http_output_filter() returned NGX_AGAIN, setting handler");
+		r->blocked++;
+		ev = r->connection->write;
+		ev->handler = mp4merge_write_handler;
+		if (!ev->active) {
+			clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+			if (ngx_handle_write_event(ev, clcf->send_lowat) != NGX_OK) {
+				ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+				"mp4merge_output_chain(): failed to set event handler");
+				return NGX_ERROR;
+			}
+		} else {
+			ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+				"event is active");
+		}
+	} else {
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+			"mp4merge: ngx_http_output_filter() failed, rc = %i", rc);
+	}
+	return rc;
+}
 static ngx_int_t ngx_http_mp4merge_handler(ngx_http_request_t *r)
 {
 	u_char                    *last;
 	size_t                     root;
 	ngx_int_t                  rc;
 	ngx_str_t                  path, value;
-	ngx_http_range_filter_ctx_t *rangectx;
 	ngx_http_mp4merge_ctx_t *ctx;
-	ngx_chain_t *out, *ol;
 	ngx_log_t *log = r->connection->log;
-	mp4_atom_t *a;
 	off_t len_head;
 
 	ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0,
@@ -372,20 +422,14 @@ static ngx_int_t ngx_http_mp4merge_handler(ngx_http_request_t *r)
 	if (!(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD)))
 		return NGX_HTTP_NOT_ALLOWED;
 
+	if (r->method == NGX_HTTP_HEAD)
+		r->header_only = 1;
+
 	if (!r->args.len)
 		return NGX_HTTP_NOT_FOUND;
 
-	rc = ngx_http_discard_request_body(r);
-
-	if (rc != NGX_OK)
+	if ((rc = ngx_http_discard_request_body(r)) != NGX_OK)
 		return rc;
-
-	rangectx = ngx_http_get_module_ctx(r, ngx_http_range_body_filter_module);
-	if (rangectx != NULL && rangectx->ranges.nelts != 1) {
-		ngx_log_error(NGX_LOG_ERR, log, 0,
-			"mp4mux: requests with multiple ranges are not supported", &value);
-		return NGX_HTTP_BAD_REQUEST;
-	}
 
 	//conf = ngx_http_get_module_loc_conf(r, ngx_http_mp4merge_module);
 
@@ -415,7 +459,6 @@ static ngx_int_t ngx_http_mp4merge_handler(ngx_http_request_t *r)
 	else
 		return NGX_HTTP_NOT_FOUND;
 
-
 	if (mp4merge_add_etag(ctx) != NGX_OK)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 
@@ -430,25 +473,11 @@ static ngx_int_t ngx_http_mp4merge_handler(ngx_http_request_t *r)
 	len_head = mp4_build_atoms(&ctx->atoms_head, log);
 	if (len_head < 0)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-
-	len_head += (ctx->co64 ? 16 : 8);
-	for (rc = 0; rc < ctx->trak_cnt; rc++)
-		mp4_adjust_co(ctx->traks + rc, len_head, ctx->co64);
-
-	// Add mdat
-	if (!(a = mp4_alloc_atom(ctx->req->pool, sizeof(mp4_atom_hdr_t) + ctx->co64 ? 8 : 0)))
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	a->hdr->type = ATOM('m', 'd', 'a', 't');
-	if (ctx->co64) {
-		a->hdr->size = htobe32(1);
-		a->hdr->u.data64[0] = htobe64(sizeof(mp4_atom_hdr_t) + 8 + ctx->mdat_len);
-	} else
-		a->hdr->size = htobe32(sizeof(mp4_atom_hdr_t) + ctx->mdat_len);
-
-	mp4mux_list_add_tail(&a->entry, &ctx->atoms_head);
+	len_head += ctx->co64 ? 16 : 8;
 
 	r->root_tested = !r->error_page;
 	r->allow_ranges = 1;
+	r->single_range = 1;
 	r->headers_out.status = NGX_HTTP_OK;
 	r->headers_out.content_length_n = len_head + ctx->mdat_len;
 	ngx_str_set(&r->headers_out.content_type, "video/mp4");
@@ -458,13 +487,45 @@ static ngx_int_t ngx_http_mp4merge_handler(ngx_http_request_t *r)
 	if (rc == NGX_ERROR || rc > NGX_OK || r->header_only)
 		return rc;
 
-	out = mp4_build_chain(ctx, &ctx->atoms_head);
-	if (!out)
-		return NGX_HTTP_INTERNAL_SERVER_ERROR;
-	for (ol = out; ol->next; ol = ol->next);
-	ol->next = ctx->chain;
+	mp4_add_mdat(ctx);
 
-	return ngx_http_output_filter(r, out);
+	ctx->mdat_len = len_head;
+	for (rc = 0; rc < ctx->trak_cnt; rc++)
+		ctx->traks[rc].chunk_cnt = 0;
+
+	if (mp4_build_chain(ctx, &ctx->atoms_head) != NGX_OK)
+		return NGX_ERROR;
+
+	if (mp4merge_co_alloc_seg(ctx, ctx->main.traksa, appendfunc_chain))
+		return NGX_ERROR;
+	if (ctx->mixin.traksa[0]->shift_pps)
+		for (rc = 0; rc < ctx->trak_cnt; rc++) {
+			ctx->traks[rc].stsc_ptr = ctx->main.traksa[rc]->stsc_ptr;
+			ctx->traks[rc].trak_len = ctx->main.traksa[rc]->co;
+		}
+	if (mp4merge_co_alloc_seg(ctx, ctx->mixin.traksa, ctx->mixin.traksa[0]->shift_pps ? appendfunc_co_only : appendfunc_chain))
+		return NGX_ERROR;
+	for (rc = 0; rc < ctx->trak_cnt; rc++)
+		ctx->main.traksa[rc]->frame_end = ctx->main.traksa[rc]->frame_cnt;
+	if (mp4merge_co_alloc_seg(ctx, ctx->main.traksa, ctx->mixin.traksa[0]->shift_pps ? appendfunc_co_only : appendfunc_chain))
+		return NGX_ERROR;
+
+	if (ctx->mixin.traksa[0]->shift_pps) {
+		for (rc = 0; rc < ctx->trak_cnt; rc++) {
+			ctx->main.traksa[rc]->frame_no = ctx->traks[rc].frameno;
+			ctx->main.traksa[rc]->stsc_ptr = ctx->traks[rc].stsc_ptr;
+			ctx->main.traksa[rc]->co = ctx->traks[rc].trak_len;
+			ctx->mixin.traksa[rc]->frame_no = 0;
+			mp4merge_co_trak_init(ctx->mixin.traksa[rc], r->connection->log);
+		}
+		ctx->cur_file = &ctx->mixin;
+	} else
+		ctx->done = 1;
+	ctx->write_handler = r->connection->write->handler;
+
+	if ((rc = mp4merge_output_chain(ctx)) != NGX_OK)
+		return rc;
+	return mp4merge_write_content(ctx);
 }
 static ngx_int_t mp4_xtts_ptr_init(mp4_xtts_ptr_t *ptr, mp4_atom_xtts_t *atom, ngx_log_t *log) {
 	uint32_t entry_count = be32toh(atom->entries);
@@ -519,10 +580,10 @@ static ngx_int_t mp4_xtts_ptr_advance_accum(mp4_xtts_ptr_t *ptr, uint32_t n, uin
 	*sample_no += n * ptr->value;
 	return NGX_OK;
 }
-static ngx_int_t mp4_stsc_ptr_init(mp4_stsc_ptr_t *ptr, mp4_atom_stsc_t *atom, uint32_t chunk_count, ngx_log_t *log)
+static ngx_int_t mp4_stsc_ptr_init(mp4_trak_t *t, ngx_log_t *log)
 {
-	uint32_t entry_cnt = be32toh(atom->sample_cnt);
-	if (be32toh(atom->hdr.size) != sizeof(mp4_atom_stsc_t) + sizeof(mp4_stsc_entry_t) * entry_cnt) {
+	uint32_t entry_cnt = be32toh(t->stsc->sample_cnt);
+	if (be32toh(t->stsc->hdr.size) != sizeof(mp4_atom_stsc_t) + sizeof(mp4_stsc_entry_t) * entry_cnt) {
 		ngx_log_error(NGX_LOG_ERR, log, 0,
 			"mp4_stsc_ptr_init: stsc atom size doesn't match entry count");
 		return NGX_ERROR;
@@ -532,16 +593,16 @@ static ngx_int_t mp4_stsc_ptr_init(mp4_stsc_ptr_t *ptr, mp4_atom_stsc_t *atom, u
 			"mp4_stsc_ptr_init: stsc table is empty!");
 		return NGX_ERROR;
 	}
-	ptr->chunk_count = chunk_count;
-	ptr->chunk_no = be32toh(atom->tbl[0].first_chunk);
-	ptr->samp_cnt = be32toh(atom->tbl[0].sample_cnt);
-	ptr->samp_left = be32toh(atom->tbl[0].sample_cnt);
-	ptr->entry = atom->tbl + 1;
-	ptr->end = atom->tbl + entry_cnt;
+	t->stsc_ptr.chunk_count = be32toh(t->stco->chunk_cnt);
+	t->stsc_ptr.chunk_no = be32toh(t->stsc->tbl[0].first_chunk);
+	t->stsc_ptr.samp_cnt = be32toh(t->stsc->tbl[0].sample_cnt);
+	t->stsc_ptr.samp_left = be32toh(t->stsc->tbl[0].sample_cnt);
+	t->stsc_ptr.entry = t->stsc->tbl + 1;
+	t->stsc_ptr.end = t->stsc->tbl + entry_cnt;
 	if (entry_cnt == 1)
-		ptr->next = ptr->chunk_count;
+		t->stsc_ptr.next = t->stsc_ptr.chunk_count + 1;
 	else
-		ptr->next = be32toh(atom->tbl[1].first_chunk);
+		t->stsc_ptr.next = be32toh(t->stsc->tbl[1].first_chunk);
 	return NGX_OK;
 }
 static ngx_int_t mp4_stsc_ptr_advance_entry2(mp4_stsc_ptr_t *ptr) {
@@ -550,7 +611,7 @@ static ngx_int_t mp4_stsc_ptr_advance_entry2(mp4_stsc_ptr_t *ptr) {
 		return NGX_ERROR;
 	}
 	ptr->samp_cnt = be32toh(ptr->entry++->sample_cnt);
-	if (ptr->entry == ptr->end)
+	if (ptr->entry >= ptr->end)
 		ptr->next = ptr->chunk_count + 1;
 	else
 		ptr->next = be32toh(ptr->entry->first_chunk);
@@ -693,10 +754,10 @@ static mp4_atom_xtts_t *merge_xtts(mp4_atom_t *stbl, uint32_t atom_type,
 	x->hdr.size = htobe32(sizeof(mp4_atom_xtts_t) + sizeof(mp4_xtts_entry_t) * (wr - x->tbl));
 	return x;
 }
-static mp4_atom_stsc_t *merge_stsc(mp4_atom_t *stbl, mp4_atom_stsc_t *a, mp4_stsc_ptr_t *ap,
+static mp4_atom_stsc_t *merge_stsc(mp4_trak_output_t *trak, mp4_atom_stsc_t *a, mp4_stsc_ptr_t *ap,
                                    mp4_atom_stsc_t *b, uint32_t b_chunks, uint32_t b_offs, ngx_pool_t *pool)
 {
-	mp4_atom_stsc_t *x = mp4_create_table(stbl, ATOM('s', 't', 's', 'c'),
+	mp4_atom_stsc_t *x = mp4_create_table(trak->stbl, ATOM('s', 't', 's', 'c'),
 		sizeof(mp4_atom_stsc_t) + (be32toh(a->sample_cnt) + be32toh(b->sample_cnt) + 3) * 12,  pool);
 	mp4_stsc_entry_t *wr, *rd, *b_end;
 	if (!x)
@@ -711,12 +772,13 @@ static mp4_atom_stsc_t *merge_stsc(mp4_atom_t *stbl, mp4_atom_stsc_t *a, mp4_sts
 	if (ap->chunk_no <= ap->chunk_count) {
 		wr->first_chunk = htobe32(ap->chunk_no);
 		wr->desc_id = ap->entry[-1].desc_id;
-		wr->sample_cnt = htobe32(be32toh(ap->entry[-1].sample_cnt)-ap->samp_left);
+		wr->sample_cnt = htobe32(ap->samp_cnt-ap->samp_left);
 		if (wr->sample_cnt) {
 			wr++;
 			chunk_offs = 1;
 		}
 	}
+	trak->chunk_cnt = ap->chunk_count + b_chunks + chunk_offs;
 	b_end = b->tbl + be32toh(b->sample_cnt);
 	for (rd = b->tbl; rd < b_end; rd++, wr++) {
 		wr->first_chunk = htobe32(be32toh(rd->first_chunk) + ap->chunk_no - 1 + chunk_offs);
@@ -834,10 +896,8 @@ static void merge_avcC(mp4_atom_stsd_t *dest, mp4_atom_avcC_t *a, mp4_atom_avcC_
 	dest->entry.avc1.hdr.size = htobe32(ptr - (u_char*)&dest->entry.avc1);
 	dest->hdr.size = htobe32(ptr - (u_char*)dest);
 }
-static ngx_int_t merge_trak(mp4_trak_output_t *dest, mp4_trak_t *a, mp4_trak_t *b,
-                            ngx_int_t frame_no, mp4_xtts_ptr_t *stts_ptr, ngx_pool_t *pool)
+static off_t merge_trak(mp4_trak_output_t *dest, mp4_trak_t *a, mp4_trak_t *b, mp4_xtts_ptr_t *stts_ptr, ngx_pool_t *pool)
 {
-	uint32_t frame_count;
 	uint32_t size, size2, b_offs = 0, stss_ptr;
 	uint32_t *ptr, *rptr, *eptr;
 	mp4_atom_stss_t *stss;
@@ -845,13 +905,12 @@ static ngx_int_t merge_trak(mp4_trak_output_t *dest, mp4_trak_t *a, mp4_trak_t *
 	mp4_atom_stsd_t *stsd;
 	mp4_atom_t *atom;
 	mp4_xtts_ptr_t ctts_ptr;
-	mp4_stsc_ptr_t stsc_ptr;
 	dest->timescale = lcm(a->timescale, b->timescale); // calculate new timescale
 	if (dest->timescale > TIMESCALE_MAX)
 		dest->timescale = TIMESCALE_MAX;
 
-	a->frame_end = frame_no;
-	b->frame_end = -1;
+	a->frame_end = dest->frameno;
+	b->frame_end = b->frame_cnt;
 
 	// mdhd
 	if (((mp4_atom_mdhd_v0_t*)dest->mdhd->hdr)->version == 0) {
@@ -864,22 +923,22 @@ static ngx_int_t merge_trak(mp4_trak_output_t *dest, mp4_trak_t *a, mp4_trak_t *
 
 	// stss
 	if (a->stss && b->stss) {
-		frame_count = be32toh(a->stss->entries) + be32toh(b->stss->entries);
-		size = sizeof(mp4_atom_stss_t) + frame_count * 4;
+		size2 = be32toh(a->stss->entries) + be32toh(b->stss->entries);
+		size = sizeof(mp4_atom_stss_t) + size2 * 4;
 		if (!(stss = mp4_create_table(dest->stbl, ATOM('s', 't', 's', 's'), size, pool)))
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
 		stss->hdr.size = htobe32(size);
-		stss->entries = htobe32(frame_count);
-		frame_count = be32toh(a->stss->entries);
-		for (stss_ptr = 0; stss_ptr < frame_count; stss_ptr++)
-			if (be32toh(a->stss->tbl[stss_ptr]) > frame_no)
+		stss->entries = htobe32(size2);
+		size2 = be32toh(a->stss->entries);
+		for (stss_ptr = 0; stss_ptr < size2; stss_ptr++)
+			if (be32toh(a->stss->tbl[stss_ptr]) > dest->frameno)
 				break;
 		ngx_memcpy(stss->tbl, a->stss->tbl, stss_ptr * 4);
 		ptr = stss->tbl + stss_ptr;
 		eptr = b->stss->tbl + be32toh(b->stss->entries);
 		for (rptr = b->stss->tbl; rptr < eptr; rptr++)
-			*ptr++ = htobe32(be32toh(*rptr) + frame_no);
-		size = be32toh(b->stsz->sample_cnt);
+			*ptr++ = htobe32(be32toh(*rptr) + dest->frameno);
+		size = b->frame_cnt;
 		eptr = a->stss->tbl + be32toh(a->stss->entries);
 		for (rptr = a->stss->tbl + stss_ptr; rptr < eptr; rptr++)
 			*ptr++ = htobe32(be32toh(*rptr) + size);
@@ -910,24 +969,39 @@ static ngx_int_t merge_trak(mp4_trak_output_t *dest, mp4_trak_t *a, mp4_trak_t *
 	}
 
 	// stsz
-	frame_count = be32toh(a->stsz->sample_cnt) + be32toh(b->stsz->sample_cnt);
-	size = sizeof(mp4_atom_stsz_t) + frame_count * 4;
+	size2 = a->frame_cnt + b->frame_cnt;
+	size = sizeof(mp4_atom_stsz_t) + size2 * 4;
 	if (!(stsz = mp4_create_table(dest->stbl, ATOM('s', 't', 's', 'z'), size, pool)))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	stsz->hdr.size = htobe32(size);
-	stsz->sample_cnt = htobe32(frame_count);
+	stsz->sample_cnt = htobe32(size2);
 	stsz->sample_size = 0;
-	ngx_memcpy(stsz->tbl, a->stsz->tbl, frame_no * 4);
-	ptr = stsz->tbl + frame_no;
-	size = be32toh(b->stsz->sample_cnt);
-	if (b->shift_pps) {
-		for(rptr = b->stsz->tbl; size; size--)
-			*ptr++ = htobe32(be32toh(*rptr++) + 1);
-	} else {
-		ngx_memcpy(ptr, b->stsz->tbl, size * 4);
-		ptr += size;
+	ptr = stsz->tbl;
+	rptr = a->stsz->tbl;
+	eptr = stsz->tbl + dest->frameno;
+	while (ptr < eptr) {
+		dest->trak_len += be32toh(*rptr);
+		*ptr++ = *rptr++;
 	}
-	ngx_memcpy(ptr, a->stsz->tbl + frame_no, (be32toh(a->stsz->sample_cnt) - frame_no) * 4);
+	rptr = b->stsz->tbl;
+	eptr = ptr + b->frame_cnt;
+	if (b->shift_pps)
+		while(ptr < eptr) {
+			size2 = be32toh(*rptr++) + 1;
+			dest->trak_len += size2;
+			*ptr++ = htobe32(size2);
+		}
+	else
+		while (ptr < eptr) {
+			dest->trak_len += be32toh(*rptr);
+			*ptr++ = *rptr++;
+		}
+	rptr = a->stsz->tbl + dest->frameno;
+	eptr = a->stsz->tbl + a->frame_cnt;
+	while (rptr < eptr) {
+		dest->trak_len += be32toh(*rptr);
+		*ptr++ = *rptr++;
+	}
 
 	// stts, ctts, stsc
 	if (!merge_xtts(dest->stbl, ATOM('s', 't', 't', 's'), a->stts, stts_ptr, b->stts, a->timescale, b->timescale, dest->timescale, pool))
@@ -935,45 +1009,46 @@ static ngx_int_t merge_trak(mp4_trak_output_t *dest, mp4_trak_t *a, mp4_trak_t *
 	if (a->ctts && b->ctts) {
 		if (mp4_xtts_ptr_init(&ctts_ptr, a->ctts, pool->log))
 			return NGX_HTTP_NOT_FOUND;
-		mp4_xtts_ptr_advance_n(&ctts_ptr, frame_no);
+		mp4_xtts_ptr_advance_n(&ctts_ptr, dest->frameno);
 		if (!merge_xtts(dest->stbl, ATOM('c', 't', 't', 's'), a->ctts, &ctts_ptr, b->ctts, a->timescale, b->timescale, dest->timescale, pool))
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	}
-	if (mp4_stsc_ptr_init(&stsc_ptr, a->stsc, be32toh(a->stco->chunk_cnt), pool->log) != NGX_OK)
+	if (mp4_stsc_ptr_init(a, pool->log) != NGX_OK)
 		return NGX_HTTP_NOT_FOUND;
-	mp4_stsc_ptr_advance_n(&stsc_ptr, frame_no);
-	if (!merge_stsc(dest->stbl, a->stsc, &stsc_ptr, b->stsc, be32toh(b->stco->chunk_cnt), b_offs, pool))
+	mp4_stsc_ptr_advance_n(&a->stsc_ptr, dest->frameno);
+	if (!merge_stsc(dest, a->stsc, &a->stsc_ptr, b->stsc, be32toh(b->stco->chunk_cnt), b_offs, pool))
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	return NGX_OK;
 }
-static inline uint64_t mp4_chunk_offset(mp4_trak_t *trak, uint32_t chunk_no) {
-	return trak->co64 ? be64toh(trak->stco->u.tbl64[chunk_no]) : be32toh(trak->stco->u.tbl[chunk_no]);
-}
-
-static ngx_int_t mp4merge_append_fbuf(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t *t, off_t size) {
+static ngx_int_t appendfunc_chain(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t *t, uint32_t size) {
+	ngx_chain_t *c = ctx->chain_last;
 	ctx->mdat_len += size;
-	if (ctx->chain_last) {
-		if (ctx->chain_last->buf->file_last == t->co && ctx->chain_last->buf->file == &t->file->file) {
+	if (c) {
+		if (c->buf->file_last == t->co && c->buf->file == &t->file->file) {
 			t->co += size;
-			ctx->chain_last->buf->file_last = t->co;
+			c->buf->file_last = t->co;
 			return NGX_OK;
 		}
-		ctx->chain_last->next = ngx_alloc_chain_link(ctx->req->pool);
-		ctx->chain_last = ctx->chain_last->next;
-	} else {
-		ctx->chain = ngx_alloc_chain_link(ctx->req->pool);
-		ctx->chain_last = ctx->chain;
-	}
-	if (!ctx->chain_last)
+		c->next = ngx_chain_get_free_buf(ctx->req->pool, &ctx->free);
+		c = c->next;
+	} else
+		ctx->chain = c = ngx_chain_get_free_buf(ctx->req->pool, &ctx->free);
+	if (!c)
 		return NGX_ERROR;
-	ctx->chain_last->next = NULL;
-	if (!(ctx->chain_last->buf = ngx_calloc_buf(ctx->req->pool)))
-		return NGX_ERROR;
-	ctx->chain_last->buf->in_file = 1;
-	ctx->chain_last->buf->file = &t->file->file;
-	ctx->chain_last->buf->file_pos = t->co;
+	ctx->chain_last = c;
+	c->next = NULL;
+	c->buf->in_file = 1;
+	c->buf->memory = 0;
+	c->buf->temporary = 0;
+	c->buf->file = &t->file->file;
+	c->buf->file_pos = t->co;
+	c->buf->tag = (ngx_buf_tag_t) &ngx_http_mp4merge_module;
 	t->co += size;
-	ctx->chain_last->buf->file_last = t->co;
+	c->buf->file_last = t->co;
+	return NGX_OK;
+}
+static ngx_int_t appendfunc_co_only(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t *t, uint32_t size) {
+	ctx->mdat_len += size + t->shift_pps;
 	return NGX_OK;
 }
 static ngx_int_t do_pps_shift(u_char *buf) {
@@ -1004,65 +1079,77 @@ static ngx_int_t do_pps_shift(u_char *buf) {
 	*(uint32_t*)buf = htobe32(be32toh(*(uint32_t*)buf) + 1);
 	return i + 2;
 }
-static ngx_int_t mp4merge_append_chunk(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t *t)
-{
-	uint32_t size = 0, flen, chunk = t->stsc_ptr.chunk_no;
+static ngx_int_t appendfunc_shift_pps(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t *t, uint32_t flen) {
+	ngx_chain_t *cl;
 	u_char buf[16];
-	ngx_int_t rc;
-	if (ctx->co64)
-		t->dest->stco->u.tbl64[t->dest->stco->chunk_cnt++] = ctx->mdat_len;
-	else
-		t->dest->stco->u.tbl[t->dest->stco->chunk_cnt++] = (uint32_t)ctx->mdat_len;
-	while (t->frame_no < t->frame_end && t->stsc_ptr.chunk_no == chunk) {
-		flen = be32toh(t->stsz->tbl[t->frame_no++]);
-		if (t->shift_pps) {
-			if (ngx_read_file(&t->file->file, buf, 16, t->co) != 16)
-				return NGX_ERROR;
-			size = be32toh(*(uint32_t*)buf) + 4;
-			if ((buf[4] & 0x1f) != 1 && (buf[4] & 0x1f) != 5 && size < flen) {
-				if (mp4merge_append_fbuf(ctx, t, size) != NGX_OK)
-					return NGX_ERROR;
-				flen -= size;
-				if (ngx_read_file(&t->file->file, buf, 16, t->co) != 16)
-					return NGX_ERROR;
-				size = be32toh(*(uint32_t*)buf);
-			}
-			if ((rc = do_pps_shift(buf)) > 0) {
-				if (ctx->chain_last) {
-					ctx->chain_last->next = ngx_alloc_chain_link(ctx->req->pool);
-					ctx->chain_last = ctx->chain_last->next;
-				} else {
-					ctx->chain = ngx_alloc_chain_link(ctx->req->pool);
-					ctx->chain_last = ctx->chain;
-				}
-				if (!ctx->chain_last)
-					return NGX_ERROR;
-				if (!(ctx->chain_last->buf = ngx_create_temp_buf(ctx->req->pool, rc)))
-					return NGX_ERROR;
-				ctx->chain_last->buf->last = ctx->chain_last->buf->end;
-				ngx_memcpy(ctx->chain_last->buf->start, buf, rc);
-				ctx->mdat_len += rc;
-				rc--;
-				t->co += rc;
-				if (mp4merge_append_fbuf(ctx, t, flen - rc) != NGX_OK)
-					return NGX_ERROR;
-			} else {
-				ngx_log_error(NGX_LOG_ERR, ctx->req->connection->log, 0,
-					"mp4merge: failed to do pps shift for frame %i at co %i",
-					t->frame_no, t->co);
-				if (mp4merge_append_fbuf(ctx, t, flen + 1) != NGX_OK)
-					return NGX_ERROR;
-				t->co--;
-			}
-		} else
-			size += flen;
-		if (mp4_stsc_ptr_advance(&t->stsc_ptr) != NGX_OK)
-			t->frame_no = UINT32_MAX;
+	ngx_int_t size, rc;
+	if (t->file->file.directio) {
+		ngx_directio_off(t->file->file.fd);
+		t->file->file.directio = 0;
 	}
-
-	if (!t->shift_pps) {
-		if (mp4merge_append_fbuf(ctx, t, size) != NGX_OK)
+	if (ngx_read_file(&t->file->file, buf, 16, t->co) != 16)
+		return NGX_ERROR;
+	size = be32toh(*(uint32_t*)buf) + 4;
+	if ((buf[4] & 0x1f) != 1 && (buf[4] & 0x1f) != 5 && size < flen) {
+		if (appendfunc_chain(ctx, t, size) != NGX_OK)
 			return NGX_ERROR;
+		flen -= size;
+		if (ngx_read_file(&t->file->file, buf, 16, t->co) != 16)
+			return NGX_ERROR;
+		size = be32toh(*(uint32_t*)buf);
+	}
+	if ((rc = do_pps_shift(buf)) > 0) {
+		if (!(cl = ngx_chain_get_free_buf(ctx->req->pool, &ctx->free)))
+			return NGX_ERROR;
+		if (ctx->chain_last)
+			ctx->chain_last->next = cl;
+		else
+			ctx->chain = cl;
+		ctx->chain_last = cl;
+		cl->buf->in_file = 0;
+		cl->buf->memory = 0;
+		cl->buf->temporary = 1;
+		if (!(cl->buf->start = ngx_palloc(ctx->req->pool, rc)))
+			return NGX_ERROR;
+		cl->buf->pos = cl->buf->start;
+		cl->buf->end = cl->buf->start + rc;
+		cl->buf->last = cl->buf->end;
+		cl->buf->tag = (ngx_buf_tag_t) &ngx_http_mp4merge_module;
+		ngx_memcpy(cl->buf->start, buf, rc);
+		ctx->mdat_len += rc;
+		rc--;
+		t->co += rc;
+		if (appendfunc_chain(ctx, t, flen - rc) != NGX_OK)
+			return NGX_ERROR;
+	} else {
+		ngx_log_error(NGX_LOG_ERR, ctx->req->connection->log, 0,
+			"mp4merge: failed to do pps shift for frame %i at co %i",
+			t->frame_no, t->co);
+		if (appendfunc_chain(ctx, t, flen + 1) != NGX_OK)
+			return NGX_ERROR;
+		t->co--;
+	}
+	return NGX_OK;
+}
+static ngx_int_t mp4merge_append_chunk(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t *t, appendfunc *append)
+{
+	uint32_t chunk = t->stsc_ptr.chunk_no;
+	if (!ctx->write_handler) {
+		if (ctx->co64)
+			t->dest->stco->u.tbl64[t->dest->chunk_cnt++] = htobe64(ctx->mdat_len);
+		else
+			t->dest->stco->u.tbl[t->dest->chunk_cnt++] = htobe32((uint32_t)ctx->mdat_len);
+	}
+	while (t->frame_no < t->frame_end && t->stsc_ptr.chunk_no == chunk) {
+		if (append(ctx, t, be32toh(t->stsz->tbl[t->frame_no++])) != NGX_OK)
+			return NGX_ERROR;
+		if (mp4_stsc_ptr_advance(&t->stsc_ptr) != NGX_OK) {
+			if (t->frame_no >= t->frame_cnt)
+				return NGX_OK;
+			ngx_log_error(NGX_LOG_ERR, ctx->req->connection->log, 0,
+				"mp4merge: stsc pointer out of range! frame_no = %uD frame_end = %uD frame_cnt = %uD", t->frame_no, t->frame_end, t->frame_cnt);
+			return NGX_ERROR;
+		}
 	}
 	if (t->stsc_ptr.chunk_no != chunk)
 		t->co = mp4_chunk_offset(t, t->stsc_ptr.chunk_no - 1);
@@ -1072,26 +1159,25 @@ static ngx_int_t mp4merge_co_trak_init(mp4_trak_t *trak, ngx_log_t *log) {
 	if (!trak->stco->chunk_cnt)
 		return NGX_ERROR;
 	trak->co = mp4_chunk_offset(trak, 0);
-	return mp4_stsc_ptr_init(&trak->stsc_ptr, trak->stsc, be32toh(trak->stco->chunk_cnt), log);
+	return mp4_stsc_ptr_init(trak, log);
 }
-static ngx_int_t mp4merge_co_alloc_seg(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t **traks)
-{
+static mp4_trak_t *mp4merge_select_trak(mp4_trak_t **traks, ngx_int_t trak_cnt) {
 	ngx_int_t i;
-	int64_t min_co;
-	mp4_trak_t *mintrak;
-	while (1) {
-		min_co = INT64_MAX;
-		mintrak = NULL;
-		for (i = 0; i < ctx->trak_cnt; i++)
-			if (traks[i]->frame_no < traks[i]->frame_end && traks[i]->co < min_co) {
-				mintrak = traks[i];
-				min_co = mintrak->co;
-			}
-		if (!mintrak)
-			break;
-		if (mp4merge_append_chunk(ctx, mintrak) != NGX_OK)
+	int64_t min_co = INT64_MAX;
+	mp4_trak_t *mintrak = NULL;
+	for (i = 0; i < trak_cnt; i++)
+		if (traks[i]->frame_no < traks[i]->frame_end && traks[i]->co < min_co) {
+			mintrak = traks[i];
+			min_co = mintrak->co;
+		}
+	return mintrak;
+}
+static ngx_int_t mp4merge_co_alloc_seg(ngx_http_mp4merge_ctx_t *ctx, mp4_trak_t **traks, appendfunc *append)
+{
+	mp4_trak_t *t;
+	while ((t = mp4merge_select_trak(traks, ctx->trak_cnt)))
+		if (mp4merge_append_chunk(ctx, t, append) != NGX_OK)
 			return NGX_ERROR;
-	}
 	return NGX_OK;
 }
 static ngx_int_t mp4_do_merge(ngx_http_mp4merge_ctx_t *ctx)
@@ -1099,7 +1185,6 @@ static ngx_int_t mp4_do_merge(ngx_http_mp4merge_ctx_t *ctx)
 	mp4_atom_t *a, *ac, *tc;
 	uint64_t ts_d, sample_a;
 	uint32_t ts_a, ts_b;
-	uint32_t frameno;
 	uint64_t sample_no;
 	mp4_xtts_ptr_t sp;
 	mp4_atom_mvhd_t *mvhd = ctx->main.mvhd;
@@ -1146,15 +1231,15 @@ static ngx_int_t mp4_do_merge(ngx_http_mp4merge_ctx_t *ctx)
 		if (mp4_xtts_ptr_init(&sp, t->stts, ctx->req->connection->log))
 			return NGX_HTTP_NOT_FOUND;
 		if (ctx->secpos) {
-			frameno = ins_frameno(t, &sp, ctx->secpos * t->timescale, &sample_no);
+			ctx->traks->frameno = ins_frameno(t, &sp, ctx->secpos * t->timescale, &sample_no);
 		} else {
 			sample_no = 0;
 			mp4_xtts_ptr_advance_accum(&sp, ctx->fpos, &sample_no);
-			frameno= adjust_to_keyframe(t, ctx->fpos, &sp, &sample_no);
+			ctx->traks->frameno = adjust_to_keyframe(t, ctx->fpos, &sp, &sample_no);
 		}
 		ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
-			"mp4merge: vframe = %uD sample_no = %uL", frameno, sample_no);
-		if ((rc = merge_trak(ctx->traks, t, ctx->mixin.traksa[0], frameno, &sp, ctx->req->pool)) != NGX_OK)
+			"mp4merge: vframe = %uD sample_no = %uL", ctx->traks->frameno, sample_no);
+		if ((rc = merge_trak(ctx->traks, t, ctx->mixin.traksa[0], &sp, ctx->req->pool)) != NGX_OK)
 			return rc;
 		ts_a = t->timescale;
 		sample_a = sample_no;
@@ -1168,10 +1253,10 @@ static ngx_int_t mp4_do_merge(ngx_http_mp4merge_ctx_t *ctx)
 		t = ctx->main.traksa[i];
 		if (mp4_xtts_ptr_init(&sp, t->stts, ctx->req->connection->log))
 			return NGX_HTTP_NOT_FOUND;
-		frameno = ins_frameno(t, &sp, sample_a * t->timescale / ts_a, &sample_no);
+		ctx->traks[i].frameno = ins_frameno(t, &sp, sample_a * t->timescale / ts_a, &sample_no);
 		ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
-			"mp4merge: aframe = %uD sample_no = %uL", frameno, sample_no);
-		if ((rc = merge_trak(ctx->traks + i, t, ctx->mixin.traksa[i], frameno, &sp, ctx->req->pool)) != NGX_OK)
+			"mp4merge: aframe = %uD sample_no = %uL", ctx->traks[i].frameno, sample_no);
+		if ((rc = merge_trak(ctx->traks + i, t, ctx->mixin.traksa[i], &sp, ctx->req->pool)) != NGX_OK)
 			return rc;
 	}
 
@@ -1185,16 +1270,13 @@ static ngx_int_t mp4_do_merge(ngx_http_mp4merge_ctx_t *ctx)
 	for (i = 0; i < ctx->trak_cnt; i++)
 	// allocate chunks
 	ctx->co64 = ctx->main.file_size + ctx->mixin.file_size > 0xffff0000;
-
 	for (i = 0; i < ctx->trak_cnt; i++) {
-		rc = be32toh(ctx->main.traksa[i]->stco->chunk_cnt) + be32toh(ctx->mixin.traksa[i]->stco->chunk_cnt) + 1;
-		if (ctx->co64)
-			ctx->traks[i].stco = mp4_create_table(ctx->traks[i].stbl, ATOM('c', 'o', '6', '4'), sizeof(mp4_atom_stco_t) + rc * 8, ctx->req->pool);
-		else
-			ctx->traks[i].stco = mp4_create_table(ctx->traks[i].stbl, ATOM('s', 't', 'c', 'o'), sizeof(mp4_atom_stco_t) + rc * 4, ctx->req->pool);
+		rc = sizeof(mp4_atom_stco_t) + ctx->traks[i].chunk_cnt * (ctx->co64 ? 8 : 4);
+		ctx->traks[i].stco = mp4_create_table(ctx->traks[i].stbl, ctx->co64 ? ATOM('c', 'o', '6', '4') : ATOM('s', 't', 'c', 'o'), rc, ctx->req->pool);
 		if (!ctx->traks[i].stco)
 			return NGX_HTTP_INTERNAL_SERVER_ERROR;
-		ctx->traks[i].stco->chunk_cnt = 0;
+		ctx->traks[i].stco->hdr.size = htobe32(rc);
+		ctx->traks[i].stco->chunk_cnt = htobe32(ctx->traks[i].chunk_cnt);
 		ctx->main.traksa[i]->tkhd->duration = mvhd->duration;
 		ctx->main.traksa[i]->dest = ctx->traks + i;
 		ctx->mixin.traksa[i]->dest = ctx->traks + i;
@@ -1202,19 +1284,70 @@ static ngx_int_t mp4_do_merge(ngx_http_mp4merge_ctx_t *ctx)
 			return NGX_HTTP_NOT_FOUND;
 		if (mp4merge_co_trak_init(ctx->mixin.traksa[i], ctx->req->connection->log) != NGX_OK)
 			return NGX_HTTP_NOT_FOUND;
+		ctx->mdat_len += ctx->traks[i].trak_len;
+	}
+	return NGX_OK;
+}
+static ngx_int_t mp4merge_write_content(ngx_http_mp4merge_ctx_t *ctx) {
+	ngx_int_t rc;
+	mp4_trak_t *t;
+	while (!ctx->done) {
+		t = mp4merge_select_trak(ctx->cur_file->traksa, ctx->trak_cnt);
+		if (!t) {
+			if (ctx->cur_file == &ctx->mixin) {
+				ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0, "mp4merge: switched to main");
+				ctx->cur_file = &ctx->main;
+				continue;
+			} else {
+				ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0, "mp4merge: done!");
+				ctx->done = 1;
+				return mp4merge_output_chain(ctx);
+			}
+		}
+		if (mp4merge_append_chunk(ctx, t, t->shift_pps ? appendfunc_shift_pps : appendfunc_chain) != NGX_OK)
+			return NGX_ERROR;
+		if (!ctx->free || !ctx->free->next)
+			rc = mp4merge_output_chain(ctx);
+		if (rc != NGX_OK)
+			return rc;
+	}
+	return NGX_OK;
+}
+static bool_t check_conn_error(ngx_http_request_t *r, ngx_connection_t *c) {
+	if (c->error && !r->blocked) {
+		ngx_http_free_request(r, NGX_ERROR);
+		ngx_http_close_connection(c);
+		return 1;
+	}
+	return 0;
+}
+static void mp4merge_write_handler(ngx_event_t *ev)
+{
+	ngx_connection_t *c = ev->data;
+	ngx_http_request_t *r = c->data;
+	ngx_http_mp4merge_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_mp4merge_module);
+	ngx_int_t rc;
+
+	ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+		"mp4merge write handler: \"%V?%V\"", &r->uri, &r->args);
+
+	ctx->write_handler(ev);
+
+	if (c->destroyed || c->error || r->done || ctx->done) {
+		ev->handler = ctx->write_handler;
+		r->blocked--;
+		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "blocked = %i", r->blocked);
+		check_conn_error(r, c);
+		return;
 	}
 
-	if (mp4merge_co_alloc_seg(ctx, ctx->main.traksa))
-		return NGX_ERROR;
-	if (mp4merge_co_alloc_seg(ctx, ctx->mixin.traksa))
-		return NGX_ERROR;
-	for (i = 0; i < ctx->trak_cnt; i++)
-		ctx->main.traksa[i]->frame_end = -1;
-	if (mp4merge_co_alloc_seg(ctx, ctx->main.traksa))
-		return NGX_ERROR;
-	for (i = 0; i < ctx->trak_cnt; i++)
-		ctx->traks[i].stco->hdr.size = htobe32(sizeof(mp4_atom_stco_t) + ctx->traks[i].stco->chunk_cnt * (ctx->co64 ? 8 : 4));
-	return NGX_OK;
+	if (!r->out || !r->out->next) {
+		ev->handler = ctx->write_handler;
+		r->blocked--;
+		rc = mp4merge_write_content(ctx);
+		if (rc != NGX_AGAIN)
+			ngx_http_finalize_request(ctx->req, rc);
+	}
 }
 static ngx_int_t mp4merge_do_open_file(ngx_open_file_info_t *of, ngx_file_t *f, ngx_http_core_loc_conf_t *clcf, ngx_http_request_t *r, ngx_str_t *name)
 {
@@ -1391,6 +1524,7 @@ static ngx_int_t mp4_atom_to_trak(mp4_atom_t *a, mp4_trak_t **tt, ngx_pool_t *po
 	case ATOM('s', 't', 's', 'z'):
 		if (t->stsz || !t->stbl) return NGX_ERROR;
 		t->stsz = (mp4_atom_stsz_t *)a->hdr;
+		t->frame_cnt = be32toh(t->stsz->sample_cnt);
 		break;
 	case ATOM('c', 'o', '6', '4'):
 		t->co64 = 1;
@@ -1417,15 +1551,20 @@ static ngx_int_t mp4_atom_to_trak(mp4_atom_t *a, mp4_trak_t **tt, ngx_pool_t *po
 	}
 	return NGX_OK;
 }
+static void debug_atom(ngx_log_t *log, char *fmt, mp4_atom_hdr_t *hdr) {
+	ngx_str_t s = {4, (u_char*)&hdr->type };
+	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0, fmt, &s);
+}
+static void debug_atom_int(ngx_log_t *log, char *fmt, mp4_atom_hdr_t *hdr, ngx_int_t i) {
+	ngx_str_t s = {4, (u_char*)&hdr->type };
+	ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0, fmt, &s, i);
+}
 static ngx_int_t mp4_parse_atom(ngx_pool_t *pool, mp4_file_t *mp4f, mp4_trak_t **trak, mp4_atom_t *atom)
 {
 	ngx_uint_t i;
 	mp4_atom_hdr_t *hdr;
 	off_t pos;
 	uint32_t size, atom_size;
-	char atom_name[5];
-
-	atom_name[4] = 0;
 
 	if (atom->hdr->type == ATOM('m', 'v', 'h', 'd')) {
 		if (mp4f->mvhd)
@@ -1444,13 +1583,11 @@ static ngx_int_t mp4_parse_atom(ngx_pool_t *pool, mp4_file_t *mp4f, mp4_trak_t *
 				if (hdr->type == ATOM('e', 'd', 't', 's'))
 					continue;
 
-				ngx_memcpy(atom_name, &hdr->type, 4);
-				ngx_log_debug2(NGX_LOG_DEBUG_HTTP, mp4f->file.log, 0,
-					"begin atom: %s %i", atom_name, size);
+				debug_atom_int(mp4f->file.log, "begin atom: %V %i", hdr, size);
 
 				if (size < 8) {
 					ngx_log_error(NGX_LOG_ERR, mp4f->file.log, 0,
-						"mp4mux: \"%V\": atom is too small:%uL",
+						"mp4merge: \"%V\": atom is too small:%uL",
 						&mp4f->fname, size);
 					return NGX_ERROR;
 				}
@@ -1459,9 +1596,9 @@ static ngx_int_t mp4_parse_atom(ngx_pool_t *pool, mp4_file_t *mp4f, mp4_trak_t *
 					return NGX_ERROR;
 
 				if (mp4_parse_atom(pool, mp4f, trak, mp4mux_list_entry(atom->atoms.prev, mp4_atom_t, entry))) {
+					ngx_str_t s = { 4, (u_char*)&hdr->type };
 					ngx_log_error(NGX_LOG_ERR, mp4f->file.log, 0,
-						"mp4mux: \"%V\": error while parsing \"%s\" atom",
-						&mp4f->fname, atom_name);
+						"mp4merge: \"%V\": error while parsing \"%V\" atom", &mp4f->fname, &s);
 					return NGX_ERROR;
 				}
 				if (*trak && hdr->type == ATOM('t', 'r', 'a', 'k')) {
@@ -1469,8 +1606,7 @@ static ngx_int_t mp4_parse_atom(ngx_pool_t *pool, mp4_file_t *mp4f, mp4_trak_t *
 					trak = &(*trak)->next;
 				}
 
-				ngx_log_debug2(NGX_LOG_DEBUG_HTTP, mp4f->file.log, 0,
-					"end atom: %s %i", atom_name, size);
+				debug_atom_int(mp4f->file.log, "end atom: %V %i", hdr, size);
 			}
 			return NGX_OK;
 		}
@@ -1484,9 +1620,6 @@ static ngx_int_t mp4_parse(ngx_http_mp4merge_ctx_t *ctx, mp4_file_t *mp4f)
 	uint32_t size;
 	uint64_t size64;
 	ngx_int_t n;
-	char atom_name[5];
-
-	atom_name[4] = 0;
 
 	MP4MUX_INIT_LIST_HEAD(&mp4f->atoms);
 
@@ -1501,9 +1634,7 @@ static ngx_int_t mp4_parse(ngx_http_mp4merge_ctx_t *ctx, mp4_file_t *mp4f)
 
 		size = be32toh(hdr.size);
 
-		memcpy(atom_name, &hdr.type, 4);
-		ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
-			"begin atom: %s %i", atom_name, size);
+		debug_atom_int(ctx->req->connection->log, "begin atom: %V %i", &hdr, size);
 
 		if (size == 1) {
 			n = ngx_read_file(&mp4f->file, (u_char *)&size64, 8, pos + sizeof(hdr));
@@ -1552,28 +1683,18 @@ static ngx_int_t mp4_parse(ngx_http_mp4merge_ctx_t *ctx, mp4_file_t *mp4f)
 			if (mp4_parse_atom(ctx->req->pool, mp4f, &mp4f->traksl, atom))
 				return NGX_HTTP_NOT_FOUND;
 		}
-		ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
-			"end atom: %s %i", atom_name, size);
+		debug_atom_int(ctx->req->connection->log, "end atom: %V %i", &hdr, size);
 	}
 
 	if (mp4f->file.directio)
 		ngx_directio_on(mp4f->file.fd);
 
-	mp4mux_list_for_each_entry(atom, &mp4f->atoms, entry) {
-		memcpy(atom_name, &atom->hdr->type, 4);
-		ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
-			"atom: %s %i", atom_name, be32toh(atom->hdr->size));
-	}
-
 	return NGX_OK;
 }
 static mp4_atom_t *mp4_clone_primitive_atom(mp4_atom_hdr_t *hdr, ngx_pool_t *pool) {
 	mp4_atom_t *anew;
-	char atom_name[5] = {0,0,0,0,0};
 
-	memcpy(atom_name, &hdr->type, 4);
-	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pool->log, 0,
-		"clone atom: %s ", atom_name);
+	debug_atom(pool->log, "clone atom: %V", hdr);
 
 	if (!(anew = mp4_alloc_atom(pool, 0)))
 		return NULL;
@@ -1615,18 +1736,13 @@ static mp4_atom_t *mp4_clone_atom(mp4_atom_t *atom, mp4_trak_output_t *dst_trak,
 
 	return anew;
 }
-
 static off_t mp4_build_atoms(mp4mux_list_t *list, ngx_log_t *log)
 {
 	off_t len = 0, n;
 	mp4_atom_t *a;
-	char atom_name[5] = {0,0,0,0,0};
 
 	mp4mux_list_for_each_entry(a, list, entry) {
-		memcpy(atom_name, &a->hdr->type, 4);
-
-		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
-			"build atom: %s", atom_name);
+		debug_atom(log, "build atom: %V", a->hdr);
 
 		if (mp4mux_list_empty(&a->atoms))
 			len += be32toh(a->hdr->size);
@@ -1640,20 +1756,15 @@ static off_t mp4_build_atoms(mp4mux_list_t *list, ngx_log_t *log)
 	return len;
 }
 
-static ngx_int_t mp4_build_chain_ex(ngx_http_mp4merge_ctx_t *ctx, mp4mux_list_t *list, ngx_chain_t **out, ngx_chain_t **last)
+static ngx_int_t mp4_build_chain(ngx_http_mp4merge_ctx_t *ctx, mp4mux_list_t *list)
 {
 	mp4_atom_t *a;
 	ngx_chain_t *tl;
 	ngx_buf_t *b;
-	char atom_name[5] = {0,0,0,0,0};
 
 	mp4mux_list_for_each_entry(a, list, entry) {
-		tl = ngx_alloc_chain_link(ctx->req->pool);//ngx_chain_get_free_buf(ctx->req->pool, &ctx->free);
-		if (!tl) {
-			return NGX_ERROR;
-		}
-		tl->next = NULL;
-		if (!(tl->buf = ngx_calloc_buf(ctx->req->pool)))
+		tl = ngx_chain_get_free_buf(ctx->req->pool, &ctx->free);
+		if (!tl)
 			return NGX_ERROR;
 
 		b = tl->buf;
@@ -1668,20 +1779,18 @@ static ngx_int_t mp4_build_chain_ex(ngx_http_mp4merge_ctx_t *ctx, mp4mux_list_t 
 			b->end = (u_char *)a->hdr + sizeof(mp4_atom_hdr_t) + ((be32toh(a->hdr->size) == 1 ? 8 : 0));
 		b->last = b->end;
 
-		memcpy(atom_name, &a->hdr->type, 4);
-		ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->req->connection->log, 0,
-			"build_chain: %s %i", atom_name, ngx_buf_size(b));
+		debug_atom_int(ctx->req->connection->log, "build_chain: %V %i", a->hdr, ngx_buf_size(b));
 
 		b->tag = (ngx_buf_tag_t) &ngx_http_mp4merge_module;
 
-		if (*out)
-			(*last)->next = tl;
+		if (ctx->chain)
+			ctx->chain_last->next = tl;
 		else
-			*out = tl;
-		*last = tl;
+			ctx->chain = tl;
+		ctx->chain_last = tl;
 
 		if (!mp4mux_list_empty(&a->atoms)) {
-			if (mp4_build_chain_ex(ctx, &a->atoms, out, last))
+			if (mp4_build_chain(ctx, &a->atoms) != NGX_OK)
 				return NGX_ERROR;
 		}
 	}
@@ -1689,21 +1798,9 @@ static ngx_int_t mp4_build_chain_ex(ngx_http_mp4merge_ctx_t *ctx, mp4mux_list_t 
 	return NGX_OK;
 }
 
-static ngx_chain_t *mp4_build_chain(ngx_http_mp4merge_ctx_t *ctx, mp4mux_list_t *list)
-{
-	ngx_chain_t *out = NULL, *last = NULL;
-
-	if (mp4_build_chain_ex(ctx, list, &out, &last) != NGX_OK)
-		return NULL;
-
-	last->buf->flush = 1;
-
-	return out;
-}
-
 static void *ngx_http_mp4merge_create_conf(ngx_conf_t *cf)
 {
-	   ngx_http_mp4merge_conf_t  *conf;
+	ngx_http_mp4merge_conf_t  *conf;
 
 	conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_mp4merge_conf_t));
 	if (conf == NULL)
