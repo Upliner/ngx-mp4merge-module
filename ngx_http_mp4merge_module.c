@@ -1302,6 +1302,16 @@ static ngx_int_t mp4_do_merge(ngx_http_mp4merge_ctx_t *ctx)
 static ngx_int_t mp4merge_write_content(ngx_http_mp4merge_ctx_t *ctx) {
 	ngx_int_t rc;
 	mp4_trak_t *t;
+	ngx_http_range_filter_ctx_t *rangectx = ngx_http_get_module_ctx(ctx->req, ngx_http_range_body_filter_module);
+	ngx_http_range_t *range = NULL;
+	bool_t skipping = 0;
+
+	if (rangectx && rangectx->ranges.nelts == 1) {
+		range = rangectx->ranges.elts;
+		if (rangectx->offset < range->start)
+			skipping = 1;
+	}
+
 	while (!ctx->done) {
 		t = mp4merge_select_trak(ctx->cur_file->traksa, ctx->trak_cnt);
 		if (!t) {
@@ -1314,6 +1324,19 @@ static ngx_int_t mp4merge_write_content(ngx_http_mp4merge_ctx_t *ctx) {
 				ctx->done = 1;
 				return mp4merge_output_chain(ctx);
 			}
+		}
+		if (skipping && !t->shift_pps)
+			skipping = 0;
+		if (skipping) {
+			int64_t size = (int64_t)be32toh(t->stsz->tbl[t->frame_no++]) + 1;
+			if (size <= (range->start - rangectx->offset)) {
+				rangectx->offset += size;
+				continue;
+			} else
+				skipping = 0;
+		} else if (range && rangectx->offset >= range->end) {
+			ctx->done = 1;
+			return mp4merge_output_chain(ctx);
 		}
 		if (mp4merge_append_chunk(ctx, t, t->shift_pps ? appendfunc_shift_pps : appendfunc_chain) != NGX_OK)
 			return NGX_ERROR;
